@@ -6,7 +6,6 @@ import tempfile
 import shutil
 import logging
 import time
-
 from boxsdk import JWTAuth, Client
 
 from logging_utils import (
@@ -14,6 +13,7 @@ from logging_utils import (
     log_checksum_ok, log_checksum_fail, log_file_transferred, log_archive,
     log_tmp_usage, log_warning, log_error, log_box_version
 )
+from dry_run_utils import is_dry_run_enabled, log_dry_run_action
 from checksum_utils import log_checksum
 from trace_utils import get_or_create_trace_id
 from file_match_utils import match_files
@@ -76,9 +76,14 @@ def download_and_upload_to_s3(sftp_client, remote_dir, bucket, prefix, local_dir
             checksum_status[filename] = f"FAIL (downloaded: {downloaded_checksum}, s3: {s3_upload_checksum})"
 
         s3_key = f"{prefix}/{date_subpath}/{filename}" if prefix else f"{date_subpath}/{filename}"
-        _, s3_duration = time_operation(s3_client.upload_file, local_path, bucket, s3_key)
-        log_file_transferred(trace_id, filename, "S3", s3_duration)
-        log_archive(trace_id, filename, s3_key)
+
+        # DRY RUN LOGIC HERE
+        if is_dry_run_enabled():
+            log_dry_run_action(f"Would upload {filename} to S3 at {s3_key}")
+        else:
+            _, s3_duration = time_operation(s3_client.upload_file, local_path, bucket, s3_key)
+            log_file_transferred(trace_id, filename, "S3", s3_duration)
+            log_archive(trace_id, filename, s3_key)
 
     t1 = time.time()
     download_time = t1 - t0
@@ -86,17 +91,20 @@ def download_and_upload_to_s3(sftp_client, remote_dir, bucket, prefix, local_dir
     mbps = (mb / download_time) if download_time else 0.0
     metrics["S3 upload speed mb/s"] = f"{mbps:.2f}"
     metrics["S3 total mb"] = f"{mb:.2f}"
+    metrics["SFTP download speed mb/s"] = f"{mbps:.2f}"
+    metrics["SFTP total mb"] = f"{mb:.2f}"
 
     transfer_status["s3"] = f"SUCCESS ({', '.join(files)})" if files else "NO FILES"
     try:
-        publish_file_transfer_metric(
-            namespace='LambdaFileTransfer',
-            direction='SFTP_TO_S3',
-            file_count=len(files),
-            total_bytes=total_bytes,
-            duration_sec=round(download_time,2),
-            trace_id=trace_id
-        )
+        if not is_dry_run_enabled():
+            publish_file_transfer_metric(
+                namespace='LambdaFileTransfer',
+                direction='SFTP_TO_S3',
+                file_count=len(files),
+                total_bytes=total_bytes,
+                duration_sec=round(download_time, 2),
+                trace_id=trace_id
+            )
     except Exception as e:
         log_error(trace_id, "CloudWatch metric error for S3 transfer", exc=e)
         publish_error_metric('LambdaFileTransfer', 'S3MetricError', trace_id)
@@ -113,7 +121,7 @@ def lambda_handler(event, context):
     box_folder_id = os.getenv('BOX_FOLDER_ID')
 
     s3_bucket = os.getenv('S3_BUCKET', 'jams-ftp-process-bucket')
-    s3_prefix = os.getenv('S3_PREFIX', 'ftp-ftp-list')
+    s3_prefix = os.getenv('S3_PREFIX', 'ftp-listings')
     sns_topic_arn = os.getenv("SNS_TOPIC_ARN")
 
     src_secret = get_secret(src_secret_name)
@@ -133,7 +141,6 @@ def lambda_handler(event, context):
     )
     box_client = Client(auth)
 
-    # --- METRICS, STATUS, CHECKSUM dicts ---
     metrics = {}
     transfer_status = {}
     checksum_status = {}
@@ -147,7 +154,7 @@ def lambda_handler(event, context):
         src_sftp = create_sftp_client(src_host, 22, src_user, src_pass)
         log_sftp_connection(trace_id, src_host, "OPENED")
 
-        # SFTP -> S3 (and download metric)
+        # SFTP -> S3
         download_and_upload_to_s3(
             src_sftp, src_dir, s3_bucket, s3_prefix, tmp_dir, trace_id, job_id,
             file_patterns, metrics, transfer_status, checksum_status, errors, warnings
@@ -170,17 +177,20 @@ def lambda_handler(event, context):
                     shutil.copy2(os.path.join(tmp_dir, fname), os.path.join(box_tmp_dir, fname))
                 box_total_bytes = sum(os.path.getsize(os.path.join(box_tmp_dir, f)) for f in box_files)
                 t0 = time.time()
-                upload_files_to_box_by_date(box_client, box_folder_id, box_tmp_dir, context)
-                t1 = time.time()
-                box_upload_time = t1 - t0
-                box_mb = box_total_bytes / 1024 / 1024 if box_total_bytes else 0.0
-                box_mbps = (box_mb / box_upload_time) if box_upload_time else 0.0
-                metrics["Box upload speed mb/s"] = f"{box_mbps:.2f}"
-                metrics["Box total mb"] = f"{box_mb:.2f}"
-                transfer_status["box"] = f"SUCCESS ({', '.join(box_files)})"
-                for fname in box_files:
-                    log_box_version(trace_id, fname, "box_id", "box_version")
-                log_file_transferred(trace_id, f"{len(box_files)} file(s)", "Box", box_upload_time, box_mbps)
+                if is_dry_run_enabled():
+                    log_dry_run_action(f"Would upload files {[f for f in os.listdir(box_tmp_dir)]} to Box folder {box_folder_id}")
+                else:
+                    upload_files_to_box_by_date(box_client, box_folder_id, box_tmp_dir, context)
+                    t1 = time.time()
+                    box_upload_time = t1 - t0
+                    box_mb = box_total_bytes / 1024 / 1024 if box_total_bytes else 0.0
+                    box_mbps = (box_mb / box_upload_time) if box_upload_time else 0.0
+                    metrics["Box upload speed mb/s"] = f"{box_mbps:.2f}"
+                    metrics["Box total mb"] = f"{box_mb:.2f}"
+                    transfer_status["box"] = f"SUCCESS ({', '.join(box_files)})"
+                    for fname in box_files:
+                        log_box_version(trace_id, fname, "box_id", "box_version")
+                    log_file_transferred(trace_id, f"{len(box_files)} file(s)", "Box", box_upload_time, box_mbps)
             else:
                 warnings.append("No files matched FILE_PATTERN for Box, skipping Box upload.")
                 transfer_status["box"] = "NO FILES"
@@ -191,18 +201,18 @@ def lambda_handler(event, context):
         free_mb = shutil.disk_usage(tmp_dir).free // (1024 * 1024)
         log_tmp_usage(trace_id, len(os.listdir(tmp_dir)), free_mb)
 
-    # Send SNS Alert
+    # Send SNS Alert (always runs, even for dry run)
     send_file_transfer_sns_alert(
         sns_topic_arn, trace_id,
         transfer_status=transfer_status,
         checksum_status=checksum_status,
         errors=errors,
         warnings=warnings,
-        function_name=context.function_name if context else "lambda_function"
+        function_name="lambda_handler"
     )
 
     log_job_end(trace_id, job_id)
     return {
         'statusCode': 200,
-        'body': json.dumps({'message': 'Files transferred to S3 and Box.', 'trace_id': trace_id})
+        'body': json.dumps({'message': 'Files transferred successfully to all destinations.', 'trace_id': trace_id})
     }
